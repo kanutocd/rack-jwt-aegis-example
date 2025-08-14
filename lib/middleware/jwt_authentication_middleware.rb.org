@@ -1,0 +1,122 @@
+# frozen_string_literal: true
+
+class JwtAuthenticationMiddleware
+  def initialize(app)
+    @app = app
+  end
+
+  def call(env)
+    request = Rack::Request.new(env)
+
+    # Skip authentication for certain paths
+    return @app.call(env) if skip_authentication?(request.path_info)
+
+    # Extract JWT token from Authorization header
+    token = extract_bearer_token(request)
+    return unauthorized_response('Missing or invalid Authorization header') unless token
+
+    # Decode and verify JWT
+    begin
+      payload = JwtService.decode(token)
+    rescue StandardError => e
+      return unauthorized_response("Invalid or expired token: #{e.message}")
+    end
+
+    # Validate required headers and URL components
+    validation_result = validate_request(request, payload)
+    return validation_result unless validation_result.nil?
+
+    # Add payload to request environment for controllers to use
+    env['jwt.payload'] = payload
+    env['jwt.current_user_id'] = payload[:user_id]
+
+    @app.call(env)
+  end
+
+  private
+
+  def skip_authentication?(path)
+    # Skip authentication for login, health check, and public endpoints
+    skip_paths = [
+      '/api/v1/login',
+      '/api/v1/refresh',
+      '/up',
+      '/rails/health',
+    ] + ENV.fetch('PUBLIC_API_PATHS', '').split(',').strip
+
+    skip_paths.any? { |skip_path| path.start_with?(skip_path) }
+  end
+
+  def extract_bearer_token(request)
+    auth_header = request.get_header('HTTP_AUTHORIZATION')
+    return nil unless auth_header&.start_with?('Bearer ')
+
+    auth_header.split(' ').last
+  end
+
+  def validate_request(request, payload)
+    # 1. Validate x-company-group-id header matches JWT payload
+    company_group_id_header = request.get_header('HTTP_X_COMPANY_GROUP_ID')
+    unless company_group_id_header == payload[:company_group_id].to_s
+      return forbidden_response('Company group ID mismatch between header and token')
+    end
+
+    # 2. Extract and validate subdomain matches JWT payload company_group_domain
+    host = request.host
+    subdomain = extract_subdomain(host)
+    unless subdomain == payload[:company_group_domain]
+      return forbidden_response('Subdomain mismatch with token company group domain')
+    end
+
+    # 3. Extract company slug from URL path and validate against JWT payload
+    company_slug = extract_company_slug_from_path(request.path_info)
+    if company_slug && !payload[:company_slugs].include?(company_slug)
+      return forbidden_response('User does not have access to the specified company')
+    end
+
+    nil # All validations passed
+  end
+
+  def extract_subdomain(host)
+    # Extract subdomain from host (e.g., "acme-corp.my-saas-app.co.il" -> "acme-corp")
+    parts = host.split('.')
+    return nil if parts.length < 3
+
+    parts.first
+  end
+
+  def extract_company_slug_from_path(path)
+    # Extract company slug from API path: /api/v1/{company-slug}/...
+    # Pattern: /api/v1/company-slug/module/...
+    path_parts = path.split('/')
+    return nil if path_parts.length < 4 || path_parts[1] != 'api' || path_parts[2] != 'v1'
+
+    path_parts[3] # This should be the company slug
+  end
+
+  def unauthorized_response(message)
+    response_body = { error: message, status: 401 }.to_json
+
+    [
+      401,
+      {
+        'Content-Type' => 'application/json',
+        'Content-Length' => response_body.bytesize.to_s,
+      },
+      [ response_body ],
+    ]
+  end
+
+  def forbidden_response(message)
+    response_body = { error: message, status: 403 }.to_json
+
+    [
+      403,
+      {
+        'Content-Type' => 'application/json',
+        'Content-Length' => response_body.bytesize.to_s,
+      },
+      [ response_body ],
+    ]
+  end
+end
